@@ -26,6 +26,24 @@ python3 app.py --db ./data.db --port 8306
 
 - `consignment`：检疫批次；`facility`：温室、苗圃或下游种植点。
 
+## 离线登记与对账
+
+- 批次登记传 `"offline": true` 后进入 `offline_registered`，登记数据必须包含凭证号 `certificate_no`、查验人 `inspector`、现场结论 `site_conclusion` 和种植点 `facility_id`。
+- `POST /api/reconciliation`：网络恢复后批量对账，请体 `{"items":[{"code","certificate_no","official_result":"matched|returned|revoked"}]}`，逐条返回结果，单条失败不阻断整批；也可对单个批次执行 `reconcile` 动作。
+- 官方结论为 `returned`/`revoked` 时批次进入 `held`，所属种植点自动转为 `shipping_suspended` 停止调运；挂起期间不能创建新批次，也不能放行。
+- `review` 动作把批次转入 `correction_pending`（人工复核只能留待修正）；只有官方再次对账为 `matched` 才能解除拦截，挂起批次清零后种植点自动恢复。
+
+## 跨口岸凭证冲突
+
+- `POST /api/certificate-revisions`：提交凭证修改 `{"certificate_no","port","facility_id","base_revision_id","changes","submitted_at"}`；同一基准版本被不同口岸（或不同种植点）修改时两版都保留并登记冲突，响应中 `"conflict": true`。
+- `GET /api/certificate-conflicts[?certificate_no=...]`：列出冲突，两版按提交时间、再按种植点排序。
+
+## 旧数据升级回填
+
+- `POST /api/upgrade/backfill`：按批号回填凭证号，请体 `{"mappings":{"批号":"凭证号"}}`，返回 `updated`/`failed`；失败（批号不存在、重号、凭证号缺失）会写入可重试记录。
+- `GET /api/backfill-failures[?status=pending]`：查看失败记录与重试次数。
+- `POST /api/backfill-failures/<code>/retry`：按记录中的凭证号重试（也可在请体中带 `certificate_no` 覆盖）。
+
 ## 主要接口
 
 - `GET /health`：健康检查。

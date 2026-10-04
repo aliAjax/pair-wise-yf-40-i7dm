@@ -54,6 +54,36 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS certificate_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    certificate_no TEXT NOT NULL,
+                    port TEXT NOT NULL,
+                    facility_id TEXT,
+                    base_revision_id INTEGER,
+                    changes TEXT NOT NULL,
+                    submitted_at TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_revisions_certificate
+                    ON certificate_revisions(certificate_no, id);
+                CREATE TABLE IF NOT EXISTS certificate_conflicts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    certificate_no TEXT NOT NULL,
+                    left_revision_id INTEGER NOT NULL,
+                    right_revision_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(certificate_no, left_revision_id, right_revision_id)
+                );
+                CREATE TABLE IF NOT EXISTS backfill_failures (
+                    code TEXT PRIMARY KEY,
+                    certificate_no TEXT,
+                    reason TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 1,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
             """)
 
     @staticmethod
@@ -195,6 +225,157 @@ class SQLiteRepository:
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
             )
+
+    # ---- 凭证多版本与冲突 -------------------------------------------------
+
+    @staticmethod
+    def _revision_from_row(row):
+        return {
+            "id": row["id"],
+            "certificate_no": row["certificate_no"],
+            "port": row["port"],
+            "facility_id": row["facility_id"],
+            "base_revision_id": row["base_revision_id"],
+            "changes": json.loads(row["changes"]),
+            "submitted_at": row["submitted_at"],
+            "created_by": row["created_by"],
+            "created_at": row["created_at"],
+        }
+
+    def add_certificate_revision(
+        self, certificate_no, port, facility_id, base_revision_id, changes, submitted_at, created_by
+    ):
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO certificate_revisions"
+                "(certificate_no, port, facility_id, base_revision_id, changes, submitted_at, created_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    certificate_no,
+                    port,
+                    facility_id,
+                    base_revision_id,
+                    json.dumps(changes, ensure_ascii=False, sort_keys=True),
+                    submitted_at,
+                    created_by,
+                    utcnow(),
+                ),
+            )
+            revision_id = cursor.lastrowid
+        return self.get_certificate_revision(revision_id)
+
+    def get_certificate_revision(self, revision_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM certificate_revisions WHERE id = ?", (revision_id,)
+            ).fetchone()
+        return self._revision_from_row(row) if row else None
+
+    def list_certificate_revisions(self, certificate_no=None):
+        with self._connect() as connection:
+            if certificate_no:
+                rows = connection.execute(
+                    "SELECT * FROM certificate_revisions WHERE certificate_no = ? ORDER BY id",
+                    (certificate_no,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM certificate_revisions ORDER BY certificate_no, id"
+                ).fetchall()
+        return [self._revision_from_row(row) for row in rows]
+
+    def add_certificate_conflict(self, certificate_no, left_revision_id, right_revision_id):
+        first, second = sorted((left_revision_id, right_revision_id))
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO certificate_conflicts"
+                "(certificate_no, left_revision_id, right_revision_id, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (certificate_no, first, second, utcnow()),
+            )
+
+    def _conflict_from_row(self, row, revisions):
+        ordered = sorted(
+            (revisions[row["left_revision_id"]], revisions[row["right_revision_id"]]),
+            key=lambda item: (item["submitted_at"], item.get("facility_id") or ""),
+        )
+        return {
+            "id": row["id"],
+            "certificate_no": row["certificate_no"],
+            # 按提交时间、再按种植点排列的两版
+            "versions": ordered,
+            "created_at": row["created_at"],
+        }
+
+    def list_certificate_conflicts(self, certificate_no=None):
+        with self._connect() as connection:
+            if certificate_no:
+                rows = connection.execute(
+                    "SELECT * FROM certificate_conflicts WHERE certificate_no = ? ORDER BY id",
+                    (certificate_no,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM certificate_conflicts ORDER BY certificate_no, id"
+                ).fetchall()
+        revisions = {
+            item["id"]: item
+            for item in self.list_certificate_revisions(certificate_no)
+        }
+        return [self._conflict_from_row(row, revisions) for row in rows]
+
+    # ---- 旧数据凭证号回填失败记录 -----------------------------------------
+
+    def record_backfill_failure(self, code, certificate_no, reason):
+        now = utcnow()
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO backfill_failures(code, certificate_no, reason, attempts, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, 1, 'pending', ?, ?) "
+                "ON CONFLICT(code) DO UPDATE SET "
+                "certificate_no = excluded.certificate_no, reason = excluded.reason, "
+                "attempts = attempts + 1, status = 'pending', updated_at = excluded.updated_at",
+                (code, certificate_no, reason, now, now),
+            )
+
+    def resolve_backfill_failure(self, code):
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE backfill_failures SET status = 'resolved', updated_at = ? WHERE code = ?",
+                (utcnow(), code),
+            )
+
+    @staticmethod
+    def _backfill_failure_from_row(row):
+        return {
+            "code": row["code"],
+            "certificate_no": row["certificate_no"],
+            "reason": row["reason"],
+            "attempts": int(row["attempts"]),
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def list_backfill_failures(self, status=None):
+        with self._connect() as connection:
+            if status:
+                rows = connection.execute(
+                    "SELECT * FROM backfill_failures WHERE status = ? ORDER BY code",
+                    (status,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM backfill_failures ORDER BY status, code"
+                ).fetchall()
+        return [self._backfill_failure_from_row(row) for row in rows]
+
+    def get_backfill_failure(self, code):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM backfill_failures WHERE code = ?", (code,)
+            ).fetchone()
+        return self._backfill_failure_from_row(row) if row else None
 
     def ping(self):
         with self._connect() as connection:

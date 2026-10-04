@@ -85,6 +85,20 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "certificate-conflicts"]:
+                    query = parse_qs(parsed.query)
+                    certificate_no = query.get("certificate_no", [None])[0]
+                    return self._send(
+                        200,
+                        {"items": service.list_certificate_conflicts(certificate_no)},
+                    )
+                if parts == ["api", "backfill-failures"]:
+                    query = parse_qs(parsed.query)
+                    status = query.get("status", [None])[0]
+                    return self._send(
+                        200,
+                        {"items": service.list_backfill_failures(status)},
+                    )
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -107,6 +121,43 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if parts == ["api", "reconciliation"]:
+                    body = self._body()
+                    return self._send(
+                        200, service.reconcile_many(actor, body.get("items", []))
+                    )
+                if parts == ["api", "certificate-revisions"]:
+                    body = self._body()
+                    return self._send(
+                        201,
+                        service.submit_certificate_revision(
+                            actor,
+                            body.get("certificate_no"),
+                            body.get("port"),
+                            body.get("changes", {}),
+                            body.get("facility_id"),
+                            body.get("base_revision_id"),
+                            body.get("submitted_at"),
+                            self.headers.get("Idempotency-Key"),
+                        ),
+                    )
+                if parts == ["api", "upgrade", "backfill"]:
+                    body = self._body()
+                    return self._send(
+                        200, service.backfill_certificate_numbers(body.get("mappings", {}))
+                    )
+                if (
+                    len(parts) == 4
+                    and parts[:2] == ["api", "backfill-failures"]
+                    and parts[3] == "retry"
+                ):
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.retry_backfill(
+                            parts[2], body.get("certificate_no")
+                        ),
+                    )
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)

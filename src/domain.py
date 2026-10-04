@@ -33,6 +33,7 @@ class Role(str, Enum):
     inspector = "inspector"
     quarantine = "quarantine"
     lab = "lab"
+    official = "official"
 
 
 @dataclass

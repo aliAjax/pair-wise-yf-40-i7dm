@@ -54,6 +54,34 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS conflicts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity_kind TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    credential_no TEXT NOT NULL,
+                    version_a TEXT NOT NULL,
+                    version_b TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    resolution TEXT,
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_conflicts_status
+                    ON conflicts(status);
+                CREATE TABLE IF NOT EXISTS backfill_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_kind TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    batch_code TEXT NOT NULL,
+                    field TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_backfill_status
+                    ON backfill_records(status);
             """)
 
     @staticmethod
@@ -195,6 +223,123 @@ class SQLiteRepository:
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
             )
+
+    # --- concurrent modification conflicts ---
+
+    def create_conflict(self, entity_kind, entity_id, credential_no, version_a, version_b):
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO conflicts(entity_kind, entity_id, credential_no, version_a, version_b, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 'open', ?)",
+                (
+                    entity_kind,
+                    entity_id,
+                    credential_no,
+                    json.dumps(version_a, ensure_ascii=False, sort_keys=True),
+                    json.dumps(version_b, ensure_ascii=False, sort_keys=True),
+                    utcnow(),
+                ),
+            )
+            conflict_id = cursor.lastrowid
+        return self.get_conflict(conflict_id)
+
+    def get_conflict(self, conflict_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM conflicts WHERE id = ?", (conflict_id,)
+            ).fetchone()
+        return self._conflict_from_row(row) if row else None
+
+    def list_conflicts(self, status=None):
+        with self._connect() as connection:
+            if status:
+                rows = connection.execute(
+                    "SELECT * FROM conflicts WHERE status = ? ORDER BY id", (status,)
+                ).fetchall()
+            else:
+                rows = connection.execute("SELECT * FROM conflicts ORDER BY id").fetchall()
+        return [self._conflict_from_row(row) for row in rows]
+
+    def resolve_conflict_record(self, conflict_id, resolution):
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE conflicts SET status = 'resolved', resolution = ?, resolved_at = ? "
+                "WHERE id = ?",
+                (json.dumps(resolution, ensure_ascii=False, sort_keys=True), utcnow(), conflict_id),
+            )
+
+    @staticmethod
+    def _conflict_from_row(row):
+        return {
+            "id": row["id"],
+            "entity_kind": row["entity_kind"],
+            "entity_id": row["entity_id"],
+            "credential_no": row["credential_no"],
+            "version_a": json.loads(row["version_a"]),
+            "version_b": json.loads(row["version_b"]),
+            "status": row["status"],
+            "resolution": json.loads(row["resolution"]) if row["resolution"] else None,
+            "created_at": row["created_at"],
+            "resolved_at": row["resolved_at"],
+        }
+
+    # --- backfill (credential number upgrade) records ---
+
+    def create_backfill_record(self, target_kind, target_id, batch_code, field, status, last_error):
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO backfill_records(target_kind, target_id, batch_code, field, status, attempts, last_error, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
+                (target_kind, target_id, batch_code, field, status, last_error, utcnow(), utcnow()),
+            )
+            record_id = cursor.lastrowid
+        return self.get_backfill_record(record_id)
+
+    def get_backfill_record(self, record_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM backfill_records WHERE id = ?", (record_id,)
+            ).fetchone()
+        return self._backfill_from_row(row) if row else None
+
+    def list_backfill(self, status=None):
+        with self._connect() as connection:
+            if status:
+                rows = connection.execute(
+                    "SELECT * FROM backfill_records WHERE status = ? ORDER BY id", (status,)
+                ).fetchall()
+            else:
+                rows = connection.execute("SELECT * FROM backfill_records ORDER BY id").fetchall()
+        return [self._backfill_from_row(row) for row in rows]
+
+    def update_backfill_record(self, record_id, status, last_error=None, increment_attempts=False):
+        with self._connect() as connection:
+            if increment_attempts:
+                connection.execute(
+                    "UPDATE backfill_records SET status = ?, attempts = attempts + 1, last_error = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    (status, last_error, utcnow(), record_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE backfill_records SET status = ?, last_error = ?, updated_at = ? WHERE id = ?",
+                    (status, last_error, utcnow(), record_id),
+                )
+
+    @staticmethod
+    def _backfill_from_row(row):
+        return {
+            "id": row["id"],
+            "target_kind": row["target_kind"],
+            "target_id": row["target_id"],
+            "batch_code": row["batch_code"],
+            "field": row["field"],
+            "status": row["status"],
+            "attempts": row["attempts"],
+            "last_error": row["last_error"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
     def ping(self):
         with self._connect() as connection:

@@ -90,6 +90,12 @@ def create_handler(service, rules, static_dir):
                 if len(parts) >= 2 and parts[0] == "api":
                     if parts[1] == "entities":
                         raise NotFoundError("not found")
+                    if len(parts) == 2 and parts[1] in ("conflicts", "backfill"):
+                        query = parse_qs(parsed.query)
+                        status = query.get("status", [None])[0]
+                        if parts[1] == "conflicts":
+                            return self._send(200, {"items": service.list_conflicts(status=status)})
+                        return self._send(200, {"items": service.list_backfill(status=status)})
                     if len(parts) == 3:
                         return self._send(200, service.get(parts[2]))
                     query = parse_qs(parsed.query)
@@ -118,6 +124,37 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], action, data, expected),
                     )
+                if len(parts) == 3 and parts == ["api", "upgrade", "backfill"]:
+                    return self._send(200, service.upgrade_backfill(actor))
+                if len(parts) == 4 and parts[0] == "api":
+                    if parts[1] == "backfill" and parts[3] == "retry":
+                        return self._send(200, service.retry_backfill(actor, parts[2]))
+                    if parts[1] == "conflicts" and parts[3] == "resolve":
+                        body = self._body()
+                        return self._send(
+                            200, service.resolve_conflict(actor, parts[2], body.get("pick"))
+                        )
+                    if parts[1] == "credentials" and parts[3] == "modify":
+                        body = self._body()
+                        expected = body.pop("expected_version", None)
+                        return self._send(
+                            200,
+                            service.modify_credential(
+                                actor, parts[2], body,
+                                port=body.get("port"),
+                                submitted_at=body.get("submitted_at"),
+                                expected_version=expected,
+                                planting_site=body.get("planting_site"),
+                            ),
+                        )
+                    if parts[1] == "consignments" and parts[3] == "reconcile":
+                        return self._send(200, service.reconcile_consignment(actor, parts[2]))
+                    if parts[1] == "consignments" and parts[3] == "correct":
+                        body = self._body()
+                        return self._send(
+                            200,
+                            service.correct_consignment(actor, parts[2], body.get("correction")),
+                        )
                 if len(parts) == 4 and parts[0] == "api" and parts[3] == "actions":
                     body = self._body()
                     action = body.pop("action", None)

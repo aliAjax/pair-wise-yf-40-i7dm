@@ -13,6 +13,10 @@ def _validate_consignment(actor, data, lookup):
         raise ValidationError("origin and destination must differ")
 
 
+def _validate_register(actor, entity, data, lookup):
+    return {"registered_by": actor.user_id, "reconciled": False}
+
+
 def _validate_quarantine(actor, entity, data, lookup):
     if not data.get("pest_found"):
         raise ValidationError("pest_found must be true for quarantine")
@@ -20,6 +24,10 @@ def _validate_quarantine(actor, entity, data, lookup):
 
 
 def _validate_release(actor, entity, data, lookup):
+    if entity.get("data", {}).get("official_hold"):
+        raise InvalidTransition(
+            "batch is under official hold; manual review cannot release it"
+        )
     if data.get("pest_found"):
         raise ValidationError("pest-positive consignment cannot be released")
     if data.get("treatment") not in ("none", "completed", "certified"):
@@ -44,17 +52,21 @@ def trace_downstream(consignments, start_id):
 
 
 CUSTOM_CREATE = {'consignment': _validate_consignment}
-CUSTOM_TRANSITIONS = {('consignment', 'quarantine'): _validate_quarantine, ('consignment', 'release'): _validate_release}
+CUSTOM_TRANSITIONS = {
+    ('consignment', 'register'): _validate_register,
+    ('consignment', 'quarantine'): _validate_quarantine,
+    ('consignment', 'release'): _validate_release,
+}
 
 
 class RuleEngine:
-    ALIASES = {'consignments': 'consignment', 'facilities': 'facility'}
-    INITIAL_STATUS = {'consignment': 'declared', 'facility': 'registered'}
-    TRANSITIONS = {'consignment': {'inspect': (('declared',), 'inspected'), 'quarantine': (('inspected',), 'quarantined'), 'release': (('inspected',), 'released'), 'destroy': (('quarantined',), 'destroyed'), 'recheck': (('quarantined',), 'inspected')}, 'facility': {'trace': (('registered',), 'traced')}}
-    CREATE_REQUIRED = {'consignment': ('code', 'origin', 'destination'), 'facility': ('name', 'address')}
-    ACTION_REQUIRED = {('consignment', 'inspect'): ('inspector', 'inspection_result'), ('consignment', 'quarantine'): ('pest_found', 'sample_id'), ('consignment', 'release'): ('pest_found', 'treatment'), ('consignment', 'destroy'): ('method', 'witnessed_by'), ('consignment', 'recheck'): ('sample_id',), ('facility', 'trace'): ('consignment_ids',)}
-    CREATE_ROLES = {'consignment': ('admin', 'inspector'), 'facility': ('admin', 'quarantine')}
-    ROLE_ACTIONS = {'inspect': ('admin', 'inspector'), 'quarantine': ('admin', 'quarantine'), 'release': ('admin', 'quarantine'), 'destroy': ('admin', 'quarantine'), 'recheck': ('admin', 'inspector'), 'trace': ('admin', 'quarantine')}
+    ALIASES = {'consignments': 'consignment', 'facilities': 'facility', 'credentials': 'credential'}
+    INITIAL_STATUS = {'consignment': 'declared', 'facility': 'registered', 'credential': 'valid'}
+    TRANSITIONS = {'consignment': {'inspect': (('declared',), 'inspected'), 'register': (('declared',), 'inspected'), 'quarantine': (('inspected',), 'quarantined'), 'release': (('inspected',), 'released'), 'destroy': (('quarantined',), 'destroyed'), 'recheck': (('quarantined',), 'inspected')}, 'facility': {'trace': (('registered',), 'traced')}, 'credential': {'return': (('valid',), 'returned'), 'revoke': (('valid',), 'revoked'), 'lift': (('returned', 'revoked'), 'valid')}}
+    CREATE_REQUIRED = {'consignment': ('code', 'origin', 'destination'), 'facility': ('name', 'address'), 'credential': ('credential_no',)}
+    ACTION_REQUIRED = {('consignment', 'inspect'): ('inspector', 'inspection_result'), ('consignment', 'register'): ('credential_no', 'inspector', 'inspection_result', 'planting_site'), ('consignment', 'quarantine'): ('pest_found', 'sample_id'), ('consignment', 'release'): ('pest_found', 'treatment'), ('consignment', 'destroy'): ('method', 'witnessed_by'), ('consignment', 'recheck'): ('sample_id',), ('facility', 'trace'): ('consignment_ids',), ('credential', 'return'): ('reason',), ('credential', 'revoke'): ('reason',), ('credential', 'lift'): ('reason',)}
+    CREATE_ROLES = {'consignment': ('admin', 'inspector'), 'facility': ('admin', 'quarantine'), 'credential': ('admin', 'quarantine')}
+    ROLE_ACTIONS = {'inspect': ('admin', 'inspector'), 'quarantine': ('admin', 'quarantine'), 'release': ('admin', 'quarantine'), 'destroy': ('admin', 'quarantine'), 'recheck': ('admin', 'inspector'), 'trace': ('admin', 'quarantine'), ('consignment', 'register'): ('admin', 'inspector'), ('consignment', 'correct'): ('admin', 'inspector'), ('consignment', 'reconcile'): ('admin', 'inspector', 'quarantine'), ('credential', 'return'): ('admin', 'quarantine'), ('credential', 'revoke'): ('admin', 'quarantine'), ('credential', 'lift'): ('admin', 'quarantine')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -76,6 +88,15 @@ class RuleEngine:
             value = data.get(field)
             if value is None or value == "" or value == [] or value == {}:
                 raise ValidationError("missing required field: " + field)
+
+    def check_role(self, actor, kind, action):
+        allowed = self.ROLE_ACTIONS.get(
+            (kind, action), self.ROLE_ACTIONS.get(action, ("admin",))
+        )
+        self._ensure_role(actor, allowed)
+
+    def check_required(self, data, fields):
+        self._require(data, fields)
 
     def validate_create(self, actor, kind, data, lookup=None):
         kind = self.normalize_kind(kind)

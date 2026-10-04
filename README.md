@@ -24,7 +24,7 @@ python3 app.py --db ./data.db --port 8306
 
 ## 核心对象
 
-- `consignment`：检疫批次；`facility`：温室、苗圃或下游种植点。
+- `consignment`：检疫批次；`facility`：温室、苗圃或下游种植点；`credential`：官方凭证。
 
 ## 主要接口
 
@@ -36,6 +36,31 @@ python3 app.py --db ./data.db --port 8306
 - `GET /api/audit`：读取审计记录。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
+
+## 离线登记与官方对账
+
+各口岸的检疫批次先离线登记，回到网络后再与官方凭证库对账。
+
+- 批次登记（`consignment`的`register`动作）记录凭证号、查验人、现场结论和种植点。
+- 对账（`POST /api/consignments/<id>/reconcile`）按凭证号核对官方状态：凭证有效则标记`reconciled`；凭证不存在则保留为待处理。
+- 官方退回（`credential`的`return`动作）或吊销（`revoke`动作）时，该凭证下的批次及其种植点停止调运（`shipment_stopped`与`official_hold`置位）。
+- 人工复核（`POST /api/consignments/<id>/correct`）只能留下修正意见，不能清除官方拦截；被拦截批次的`release`等调运动作会被拒绝。官方解除（`lift`动作）才可恢复。
+
+## 凭证并发修改与冲突
+
+两个口岸同时修改同一凭证时，后提交的一方若版本已过期，不会被直接拒绝，而是保留两版并列出冲突：
+
+- `POST /api/credentials/<凭证号>/modify`：提交`{"...":"...","port":"口岸","submitted_at":"...","expected_version":数字}`。版本过期时返回`conflict`并保留两版（各自带提交时间与种植点）。
+- `GET /api/conflicts?status=open`：列出未解决的冲突。
+- `POST /api/conflicts/<id>/resolve`：提交`{"pick":"a"|"b"}`选定保留版本。
+
+## 凭证号回填（升级）
+
+旧批次没有凭证号，升级时按批号回填：
+
+- `POST /api/upgrade/backfill`：对缺少凭证号的批次按批号查找凭证并回填；找不到凭证的留下可重试记录。
+- `GET /api/backfill?status=pending`：列出待重试的回填记录。
+- `POST /api/backfill/<id>/retry`：重试指定的回填记录。
 
 ## 测试
 
